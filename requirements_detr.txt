@@ -1,0 +1,16 @@
+# Requirements for RealSense + DETR Object Detection POC
+
+# RealSense SDK
+pyrealsense2>=2.55.1
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+
+# Computer Vision
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Utilities
+numpy>=1.24.0
