@@ -1,6 +1,7 @@
 """
-RealSense D435 + DETR Object Detection POC
+RealSense D435 + DETR Object Detection POC (Fixed Version)
 Uses Facebook's DETR (Detection Transformer) for object detection
+With improved camera initialization and error handling
 """
 
 import pyrealsense2 as rs
@@ -10,8 +11,6 @@ import torch
 from transformers import DetrImageProcessor, DetrForObjectDetection
 from PIL import Image
 import time
-import argparse
-import warnings
 
 # COCO class names (80 classes)
 COCO_CLASSES = [
@@ -31,81 +30,162 @@ COCO_CLASSES = [
 ]
 
 class RealsenseDETR:
-    def __init__(self, confidence_threshold=0.7, force_cpu=False):
+    def __init__(self, confidence_threshold=0.7):
         """
         Initialize RealSense camera and DETR model
-
+        
         Args:
             confidence_threshold: Minimum confidence for detections (0-1)
-            force_cpu: Force CPU usage even if GPU is available
         """
         print("Initializing DETR Object Detection POC...")
-
+        
         # Confidence threshold
         self.confidence_threshold = confidence_threshold
-
+        
         # Load DETR model
         print("Loading DETR model (this may take a minute)...")
-        # Suppress some warnings
-        warnings.filterwarnings('ignore', category=UserWarning, module='torch')
-
         self.processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
         self.model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-
-        # Use GPU if available and compatible
-        if force_cpu:
-            self.device = torch.device("cpu")
-            print("Using device: cpu (forced)")
-        else:
-            if torch.cuda.is_available():
-                # Check if GPU is compatible
-                try:
-                    self.device = torch.device("cuda")
-                    # Test if GPU works
-                    test_tensor = torch.zeros(1).to(self.device)
-                    print(f"Using device: cuda ({torch.cuda.get_device_name(0)})")
-                except Exception as e:
-                    print(f"GPU available but not compatible: {e}")
-                    print("Falling back to CPU")
-                    self.device = torch.device("cpu")
-            else:
-                self.device = torch.device("cpu")
-                print("Using device: cpu (no GPU available)")
-
+        
+        # Use GPU if available
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
+        print(f"Using device: {self.device}")
         
         # Initialize RealSense pipeline
-        print("Initializing RealSense D435...")
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        
-        # Configure streams
-        self.config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
-        self.config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
-        
-        # Start streaming
-        self.pipeline.start(self.config)
-        print("✅ RealSense D435 initialized successfully!")
-        
-        # Warm up camera (skip first few frames)
-        for _ in range(30):
-            self.pipeline.wait_for_frames()
+        self.pipeline = None
+        self.initialize_camera()
     
-    def get_frame(self):
-        """Get color and depth frames from RealSense"""
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
+    def initialize_camera(self):
+        """Initialize RealSense camera with better error handling"""
+        print("\nInitializing RealSense D435...")
         
-        if not color_frame or not depth_frame:
+        try:
+            # Create context and check for devices
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            
+            if len(devices) == 0:
+                raise RuntimeError("No RealSense devices found! Please check connection.")
+            
+            print(f"Found {len(devices)} RealSense device(s)")
+            
+            # Get device info
+            dev = devices[0]
+            print(f"Device: {dev.get_info(rs.camera_info.name)}")
+            print(f"Serial: {dev.get_info(rs.camera_info.serial_number)}")
+            print(f"Firmware: {dev.get_info(rs.camera_info.firmware_version)}")
+            
+            # Create pipeline
+            self.pipeline = rs.pipeline()
+            config = rs.config()
+            
+            # Enable device by serial number (more reliable)
+            config.enable_device(dev.get_info(rs.camera_info.serial_number))
+            
+            # Try different resolutions (start with lower res for compatibility)
+            resolutions = [
+                (640, 480, 30),
+                (848, 480, 30),
+                (1280, 720, 30),
+            ]
+            
+            camera_started = False
+            
+            for width, height, fps in resolutions:
+                try:
+                    print(f"\nTrying resolution: {width}x{height} @ {fps}fps...")
+                    
+                    # Clear previous config
+                    config = rs.config()
+                    config.enable_device(dev.get_info(rs.camera_info.serial_number))
+                    
+                    # Configure streams
+                    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+                    config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+                    
+                    # Start pipeline
+                    profile = self.pipeline.start(config)
+                    
+                    # Get device from profile
+                    device = profile.get_device()
+                    
+                    # Disable auto-exposure for more consistent results (optional)
+                    # Uncomment if needed:
+                    # depth_sensor = device.first_depth_sensor()
+                    # depth_sensor.set_option(rs.option.enable_auto_exposure, 1)
+                    
+                    print(f"✅ Camera started successfully at {width}x{height}")
+                    camera_started = True
+                    break
+                    
+                except Exception as e:
+                    print(f"Failed with {width}x{height}: {str(e)}")
+                    continue
+            
+            if not camera_started:
+                raise RuntimeError("Failed to start camera with any resolution")
+            
+            # Warm up - wait for auto-exposure to stabilize
+            print("\nWarming up camera (waiting for auto-exposure)...")
+            successful_frames = 0
+            max_attempts = 60  # 60 attempts = 2 seconds at 30fps
+            
+            for i in range(max_attempts):
+                try:
+                    # Use timeout
+                    frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+                    if frames.get_color_frame() and frames.get_depth_frame():
+                        successful_frames += 1
+                        if successful_frames >= 10:  # Got 10 good frames
+                            break
+                except RuntimeError:
+                    print(f"Timeout on frame {i+1}, retrying...")
+                    continue
+            
+            if successful_frames < 10:
+                print(f"⚠️  Warning: Only got {successful_frames} frames during warmup")
+            else:
+                print(f"✅ Camera warmed up successfully ({successful_frames} frames)")
+            
+            print("✅ RealSense D435 ready!")
+            
+        except Exception as e:
+            print(f"\n❌ Error initializing camera: {str(e)}")
+            print("\nTroubleshooting:")
+            print("1. Make sure RealSense Viewer can see the camera")
+            print("2. Close RealSense Viewer if it's running")
+            print("3. Try unplugging and replugging the camera")
+            print("4. Make sure you're using a USB 3.0 port (blue port)")
+            raise
+    
+    def get_frame(self, timeout_ms=5000):
+        """
+        Get color and depth frames from RealSense
+        
+        Args:
+            timeout_ms: Timeout in milliseconds
+            
+        Returns:
+            Tuple of (color_image, depth_frame) or (None, None) on error
+        """
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=timeout_ms)
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            
+            if not color_frame or not depth_frame:
+                return None, None
+            
+            # Convert to numpy arrays
+            color_image = np.asanyarray(color_frame.get_data())
+            
+            return color_image, depth_frame
+            
+        except RuntimeError as e:
+            print(f"Warning: Frame timeout - {str(e)}")
             return None, None
-        
-        # Convert to numpy arrays
-        color_image = np.asanyarray(color_frame.get_data())
-        depth_image = np.asanyarray(depth_frame.get_data())
-        
-        return color_image, depth_frame
     
     def detect_objects(self, image):
         """
@@ -253,10 +333,21 @@ class RealsenseDETR:
         """
         print("\n🎯 Running single frame detection...")
         
-        # Get frame
-        color_image, depth_frame = self.get_frame()
+        # Get frame with retry
+        max_retries = 5
+        for attempt in range(max_retries):
+            print(f"Attempting to capture frame ({attempt+1}/{max_retries})...")
+            color_image, depth_frame = self.get_frame(timeout_ms=10000)
+            
+            if color_image is not None:
+                print("✅ Frame captured successfully")
+                break
+            else:
+                print(f"⚠️  Frame capture failed, retrying...")
+                time.sleep(1)
+        
         if color_image is None:
-            print("❌ Failed to get frame")
+            print("❌ Failed to get frame after all retries")
             return
         
         # Run detection
@@ -302,19 +393,23 @@ class RealsenseDETR:
         print("Press 'q' to quit, 's' to save screenshot")
         
         frame_count = 0
+        last_detections = []
         
         try:
             while True:
                 # Get frame
-                color_image, depth_frame = self.get_frame()
+                color_image, depth_frame = self.get_frame(timeout_ms=5000)
+                
                 if color_image is None:
+                    print("⚠️  Frame skipped")
                     continue
                 
-                # Run detection every frame (or skip frames for speed)
-                if frame_count % 1 == 0:  # Process every frame
+                # Run detection every 3 frames (for speed)
+                if frame_count % 3 == 0:
                     start_time = time.time()
                     detections = self.detect_objects(color_image)
                     inference_time = time.time() - start_time
+                    last_detections = detections
                     
                     # Draw detections
                     annotated = self.draw_detections(color_image, detections, depth_frame)
@@ -326,12 +421,16 @@ class RealsenseDETR:
                         annotated, info_text, (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
                     )
-                    
-                    # Display
-                    cv2.imshow('RealSense + DETR Object Detection', annotated)
                 else:
-                    # Just show original frame
-                    cv2.imshow('RealSense + DETR Object Detection', color_image)
+                    # Reuse last detections
+                    annotated = self.draw_detections(color_image, last_detections, depth_frame)
+                    cv2.putText(
+                        annotated, f"DETR | {len(last_detections)} objects", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+                    )
+                
+                # Display
+                cv2.imshow('RealSense + DETR Object Detection', annotated)
                 
                 # Handle keyboard
                 key = cv2.waitKey(1) & 0xFF
@@ -350,85 +449,10 @@ class RealsenseDETR:
         finally:
             self.cleanup()
     
-    def run_video_file(self, video_path, output_path="output_detection.mp4"):
-        """
-        Process video file and save with detections
-
-        Args:
-            video_path: Path to input video file
-            output_path: Path to save output video
-        """
-        print(f"\n🎬 Processing video file: {video_path}")
-
-        # Open video file
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"❌ Error: Could not open video file: {video_path}")
-            return
-
-        # Get video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        print(f"Video info: {width}x{height} @ {fps} FPS, {total_frames} frames")
-
-        # Setup video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        frame_count = 0
-        start_time = time.time()
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                frame_count += 1
-
-                # Run detection
-                detections = self.detect_objects(frame)
-
-                # Draw detections (no depth info for video files)
-                annotated = self.draw_detections(frame, detections, depth_frame=None)
-
-                # Add frame info
-                info_text = f"Frame {frame_count}/{total_frames} | {len(detections)} objects"
-                cv2.putText(
-                    annotated, info_text, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
-                )
-
-                # Write frame
-                out.write(annotated)
-
-                # Progress update every 30 frames
-                if frame_count % 30 == 0:
-                    progress = (frame_count / total_frames) * 100
-                    elapsed = time.time() - start_time
-                    fps_processing = frame_count / elapsed if elapsed > 0 else 0
-                    eta = (total_frames - frame_count) / fps_processing if fps_processing > 0 else 0
-                    print(f"Progress: {progress:.1f}% ({frame_count}/{total_frames}) | "
-                          f"Processing: {fps_processing:.2f} FPS | ETA: {eta:.1f}s")
-
-        finally:
-            cap.release()
-            out.release()
-
-        elapsed_time = time.time() - start_time
-        avg_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-
-        print(f"\n✅ Video processing complete!")
-        print(f"Processed {frame_count} frames in {elapsed_time:.1f}s ({avg_fps:.2f} FPS)")
-        print(f"Output saved to: {output_path}")
-
     def cleanup(self):
         """Stop pipeline and close windows"""
         print("\nCleaning up...")
-        if hasattr(self, 'pipeline'):
+        if self.pipeline:
             self.pipeline.stop()
         cv2.destroyAllWindows()
         print("✅ Done!")
@@ -436,108 +460,32 @@ class RealsenseDETR:
 
 def main():
     """Main function"""
-    parser = argparse.ArgumentParser(description="RealSense D435 + DETR Object Detection POC")
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["single", "continuous", "video"],
-        default="single",
-        help="Detection mode: 'single' for one frame, 'continuous' for live camera, 'video' for video file"
-    )
-    parser.add_argument(
-        "--video",
-        type=str,
-        default=None,
-        help="Path to input video file (required for video mode)"
-    )
-    parser.add_argument(
-        "--confidence",
-        type=float,
-        default=0.7,
-        help="Confidence threshold for detections (0-1)"
-    )
-    parser.add_argument(
-        "--cpu",
-        action="store_true",
-        help="Force CPU usage even if GPU is available"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output filename (default: detection_result.jpg for single, output_detection.mp4 for video)"
-    )
-
-    args = parser.parse_args()
-
-    # Validate video mode
-    if args.mode == "video" and not args.video:
-        parser.error("--video is required when using video mode")
-
     print("="*60)
     print("RealSense D435 + DETR Object Detection POC")
     print("="*60)
-    print(f"Mode: {args.mode}")
-    print(f"Confidence threshold: {args.confidence}")
-
-    # Initialize detector (skip camera init for video mode)
-    if args.mode == "video":
-        # For video mode, create a simplified detector without RealSense
-        class VideoDetector:
-            def __init__(self, confidence_threshold, force_cpu):
-                print("Initializing DETR Object Detection for Video...")
-                self.confidence_threshold = confidence_threshold
-
-                # Load DETR model
-                print("Loading DETR model (this may take a minute)...")
-                warnings.filterwarnings('ignore', category=UserWarning, module='torch')
-
-                from transformers import DetrImageProcessor, DetrForObjectDetection
-                self.processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
-                self.model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-
-                # Use GPU if available and compatible
-                if force_cpu:
-                    self.device = torch.device("cpu")
-                    print("Using device: cpu (forced)")
-                else:
-                    if torch.cuda.is_available():
-                        try:
-                            self.device = torch.device("cuda")
-                            test_tensor = torch.zeros(1).to(self.device)
-                            print(f"Using device: cuda ({torch.cuda.get_device_name(0)})")
-                        except Exception as e:
-                            print(f"GPU available but not compatible: {e}")
-                            print("Falling back to CPU")
-                            self.device = torch.device("cpu")
-                    else:
-                        self.device = torch.device("cpu")
-                        print("Using device: cpu (no GPU available)")
-
-                self.model.to(self.device)
-                self.model.eval()
-
-        # Copy methods from RealsenseDETR that we need
-        VideoDetector.detect_objects = RealsenseDETR.detect_objects
-        VideoDetector.draw_detections = RealsenseDETR.draw_detections
-        VideoDetector.run_video_file = RealsenseDETR.run_video_file
-
-        detector = VideoDetector(confidence_threshold=args.confidence, force_cpu=args.cpu)
-        output = args.output if args.output else "output_detection.mp4"
-        detector.run_video_file(args.video, output)
-
-    else:
-        # Camera modes
-        detector = RealsenseDETR(confidence_threshold=args.confidence, force_cpu=args.cpu)
-
-        try:
-            if args.mode == "single":
-                output = args.output if args.output else "detection_result.jpg"
-                detector.run_single_frame(save_path=output)
-            else:  # continuous
-                detector.run_continuous()
-        finally:
-            detector.cleanup()
+    
+    try:
+        # Initialize
+        detector = RealsenseDETR(confidence_threshold=0.7)
+        
+        # Choose mode
+        print("\nSelect mode:")
+        print("1. Single frame detection")
+        print("2. Continuous detection (live)")
+        
+        choice = input("Enter choice (1 or 2): ").strip()
+        
+        if choice == "1":
+            detector.run_single_frame()
+        else:
+            detector.run_continuous()
+        
+        detector.cleanup()
+        
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
