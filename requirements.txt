@@ -1,0 +1,30 @@
+# SegFormer Training Requirements
+# Python 3.8+
+
+# Core Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Transformers and Image Processing
+transformers>=4.30.0
+pillow>=9.0.0
+opencv-python>=4.7.0
+
+# Data Processing
+numpy>=1.21.0
+scikit-learn>=1.0.0
+
+# Visualization and Progress
+matplotlib>=3.5.0
+tqdm>=4.65.0
+
+# Optional but Recommended
+# For better performance
+accelerate>=0.20.0
+
+# For data augmentation (if you add it later)
+# albumentations>=1.3.0
+
+# Jupyter support (optional)
+# jupyter>=1.0.0
+# ipython>=8.0.0
