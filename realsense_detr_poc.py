@@ -104,7 +104,7 @@ class MetricsTracker:
 
             if best_iou >= iou_threshold and best_gt_idx >= 0:
                 self.true_positives += 1
-                matched_gt.add(best_gt_idx)
+                matched_gt.add(best_gt_idx) 
             else:
                 self.false_positives += 1
 
