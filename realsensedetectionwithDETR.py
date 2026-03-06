@@ -2,6 +2,9 @@
 RealSense D435 + DETR Object Detection POC (Fixed Version)
 Uses Facebook's DETR (Detection Transformer) for object detection
 With improved camera initialization and error handling
+
+Configuration is loaded from detector_config.json — edit that file
+to change detected classes and thresholds without touching this code.
 """
 
 import pyrealsense2 as rs
@@ -15,6 +18,27 @@ import csv
 import json
 import os
 from collections import defaultdict
+
+CONFIG_FILE = "detector_config.json"
+
+def load_config(path=CONFIG_FILE):
+    if not os.path.exists(path):
+        print(f"Warning: {path} not found, using defaults.")
+        return {"detect_only": None, "confidence_threshold": 0.7, "inference_every_n_frames": 3}
+    with open(path) as f:
+        cfg = json.load(f)
+    # Strip keys starting with _ (comments/reference fields)
+    cfg = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    # Convert list to set (or None for all classes)
+    if "detect_only" in cfg and cfg["detect_only"] is not None:
+        cfg["detect_only"] = set(cfg["detect_only"])
+    return cfg
+
+CONFIG = load_config()
+print(f"Loaded config from {CONFIG_FILE}")
+print(f"  detect_only          : {CONFIG.get('detect_only')}")
+print(f"  confidence_threshold : {CONFIG.get('confidence_threshold')}")
+print(f"  inference_every      : every {CONFIG.get('inference_every_n_frames')} frames")
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
@@ -37,8 +61,7 @@ COCO_CLASSES = [
     'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-# Filter to detect only these classes (set to None to detect all)
-DETECT_ONLY = {'cell phone'}  # Add more classes like {'person', 'chair', 'cup'}
+DETECT_ONLY = CONFIG.get("detect_only")  # loaded from detector_config.json
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -691,7 +714,7 @@ class RealsenseDETR:
                     print("Frame skipped")
                     continue
 
-                if frame_count % 3 == 0:
+                if frame_count % CONFIG.get("inference_every_n_frames", 3) == 0:
                     try:
                         start_time = time.time()
                         detections = self.detect_objects(color_image)
@@ -876,7 +899,7 @@ def main():
             detector.evaluate_dataset(images_dir, annotations_file,
                                       iou_threshold=0.5, visualize=visualize)
         else:
-            detector = RealsenseDETR(confidence_threshold=0.7)
+            detector = RealsenseDETR(confidence_threshold=CONFIG.get("confidence_threshold", 0.7))
             if choice == "1":
                 detector.run_single_frame()
             else:
