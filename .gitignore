@@ -6,6 +6,22 @@ __pycache__/
 # C extensions
 *.so
 
+# Model files (too large for GitHub)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+water_bottle_model/
+water_bottle_segformer_model/
+checkpoints/
+*.weights
+
+# But keep config files
+!config.json
+!preprocessor_config.json
+!*.yaml
+
 # Distribution / packaging
 .Python
 build/
