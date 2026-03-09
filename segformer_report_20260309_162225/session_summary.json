@@ -1,0 +1,10 @@
+{
+  "session_duration_s": 88.44,
+  "total_frames": 880,
+  "avg_fps": 25.87,
+  "avg_inference_ms": 38.5,
+  "total_detections": 322,
+  "avg_confidence": 0.771,
+  "avg_depth_m": 1.215,
+  "avg_area_px": 10893.4
+}
