@@ -68,6 +68,10 @@ class MetricsTracker:
         self.frame_records = []          # list of per-frame dicts
         self.class_confidences = defaultdict(list)  # label -> [conf, ...]
         self.fps_history = []            # smoothed FPS per inference frame
+        # Ground-truth evaluation counters
+        self.true_positives  = 0
+        self.false_positives = 0
+        self.false_negatives = 0
 
     # ── Data collection ────────────────────────────────────────────────────────
 
@@ -95,6 +99,48 @@ class MetricsTracker:
             'n_detections': len(detections),
             'detections': per_det,
         })
+
+    # ── Ground-truth evaluation ────────────────────────────────────────────────
+
+    def _iou(self, b1, b2):
+        x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
+        x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+        if x2 < x1 or y2 < y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+        a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+        return inter / (a1 + a2 - inter) if (a1+a2-inter) > 0 else 0.0
+
+    def evaluate_frame(self, detections, ground_truths, iou_threshold=0.5):
+        """Match detections to ground truth bboxes and accumulate TP/FP/FN."""
+        matched = set()
+        for det in detections:
+            best_iou, best_idx = 0, -1
+            for i, gt in enumerate(ground_truths):
+                if i in matched:
+                    continue
+                iou = self._iou(det['bbox'], gt['bbox'])
+                if iou > best_iou:
+                    best_iou, best_idx = iou, i
+            if best_iou >= iou_threshold and best_idx >= 0:
+                self.true_positives += 1
+                matched.add(best_idx)
+            else:
+                self.false_positives += 1
+        self.false_negatives += len(ground_truths) - len(matched)
+
+    def get_precision(self):
+        t = self.true_positives + self.false_positives
+        return self.true_positives / t if t > 0 else 0.0
+
+    def get_recall(self):
+        t = self.true_positives + self.false_negatives
+        return self.true_positives / t if t > 0 else 0.0
+
+    def get_f1(self):
+        p, r = self.get_precision(), self.get_recall()
+        return 2*p*r/(p+r) if (p+r) > 0 else 0.0
 
     # ── Computed summaries ─────────────────────────────────────────────────────
 
@@ -133,7 +179,7 @@ class MetricsTracker:
 
     def session_summary(self):
         duration = round(time.time() - self.session_start, 2)
-        return {
+        summary = {
             'session_duration_s': duration,
             'total_frames': self.total_frames(),
             'avg_fps': self.avg_fps(),
@@ -142,6 +188,17 @@ class MetricsTracker:
             'unique_classes_detected': len(self.class_confidences),
             'class_summary': self.class_summary(),
         }
+        if self.true_positives + self.false_positives + self.false_negatives > 0:
+            summary['evaluation'] = {
+                'precision':       round(self.get_precision(), 4),
+                'recall':          round(self.get_recall(),    4),
+                'f1_score':        round(self.get_f1(),        4),
+                'true_positives':  self.true_positives,
+                'false_positives': self.false_positives,
+                'false_negatives': self.false_negatives,
+                'note':            'Evaluated on bottle class only vs All-1.json GT',
+            }
+        return summary
 
     def print_summary(self):
         s = self.session_summary()
@@ -160,6 +217,13 @@ class MetricsTracker:
             for label, stats in s['class_summary'].items():
                 print(f"  {label:<20} {stats['count']:>6}  {stats['avg_confidence']:>9.4f}"
                       f"  {stats['min_confidence']:>6.4f}  {stats['max_confidence']:>6.4f}")
+        if 'evaluation' in s:
+            ev = s['evaluation']
+            print(f"\n  Ground-truth Evaluation (IoU >= 0.5, bottle class only):")
+            print(f"  Precision  : {ev['precision']:.4f}")
+            print(f"  Recall     : {ev['recall']:.4f}")
+            print(f"  F1 Score   : {ev['f1_score']:.4f}")
+            print(f"  TP: {ev['true_positives']}  FP: {ev['false_positives']}  FN: {ev['false_negatives']}")
         print("=" * 60)
 
     # ── Export ─────────────────────────────────────────────────────────────────
@@ -283,6 +347,24 @@ class MetricsTracker:
         plt.close()
         print(f"  Saved: {path}")
 
+        # ── 5. Precision / Recall / F1 (only if GT evaluation was done) ──────
+        if self.true_positives + self.false_positives + self.false_negatives > 0:
+            metrics = ['Precision', 'Recall', 'F1 Score']
+            values  = [self.get_precision(), self.get_recall(), self.get_f1()]
+            colors  = ['steelblue', 'darkorange', 'mediumseagreen']
+            fig, ax = plt.subplots(figsize=(6, 5))
+            bars = ax.bar(metrics, values, color=colors, edgecolor='white')
+            ax.bar_label(bars, fmt='%.4f', padding=3, fontsize=11)
+            ax.set_ylim(0, 1.1)
+            ax.set_title('Precision / Recall / F1 Score  (DETR All-Objects | bottle)',
+                         fontsize=13, fontweight='bold')
+            ax.set_ylabel('Score')
+            plt.tight_layout()
+            path = os.path.join(output_dir, 'precision_recall_f1.png')
+            plt.savefig(path, dpi=150)
+            plt.close()
+            print(f"  Saved: {path}")
+
     def save_report(self, output_dir=None):
         """Save CSV + JSON + all plots to a timestamped folder."""
         if output_dir is None:
@@ -301,7 +383,7 @@ class MetricsTracker:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RealsenseDETR:
-    def __init__(self, confidence_threshold=0.5):
+    def __init__(self, confidence_threshold=0.5, no_camera=False):
         print("Initializing DETR All-Objects Detection...")
         self.confidence_threshold = confidence_threshold
 
@@ -315,7 +397,8 @@ class RealsenseDETR:
         print(f"Using device: {self.device}")
 
         self.pipeline = None
-        self.initialize_camera()
+        if not no_camera:
+            self.initialize_camera()
 
         self.metrics = MetricsTracker()
 
@@ -486,6 +569,80 @@ class RealsenseDETR:
 
         return image
 
+    # ── Dataset evaluation ─────────────────────────────────────────────────────
+
+    def evaluate_dataset(self, annotations_json, images_dir, iou_threshold=0.5):
+        """
+        Evaluate Precision / Recall / F1 against COCO-format ground truth.
+
+        Only 'bottle' detections are compared against GT (All-1.json only
+        has bottle annotations). Other detected classes are ignored for P/R/F1.
+
+        Args:
+            annotations_json : path to All-1.json (COCO format)
+            images_dir       : directory containing the RGB images
+            iou_threshold    : IoU threshold for a TP match (default 0.5)
+        """
+        print("\n" + "=" * 60)
+        print("  DETR ALL-OBJECTS  |  DATASET EVALUATION  (no camera)")
+        print("=" * 60)
+        print(f"  Annotations : {annotations_json}")
+        print(f"  Images dir  : {images_dir}")
+        print(f"  IoU thresh  : {iou_threshold}")
+        print(f"  Eval class  : bottle only (GT is bottle-only dataset)")
+
+        with open(annotations_json) as f:
+            coco = json.load(f)
+
+        id2file = {img['id']: img['file_name'] for img in coco['images']}
+
+        gt_by_image = defaultdict(list)
+        for ann in coco['annotations']:
+            if 'bbox' not in ann:
+                continue
+            x, y, w, h = ann['bbox']
+            gt_by_image[ann['image_id']].append({'bbox': [x, y, x + w, y + h]})
+
+        self.metrics.reset()
+        total_images = len(id2file)
+        print(f"\nRunning on {total_images} images...\n")
+
+        for idx, (img_id, file_name) in enumerate(id2file.items(), 1):
+            img_path = os.path.join(images_dir, file_name)
+            if not os.path.exists(img_path):
+                img_path = os.path.join(images_dir, os.path.basename(file_name))
+            if not os.path.exists(img_path):
+                print(f"  [{idx}/{total_images}] SKIP (not found): {file_name}")
+                continue
+
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                print(f"  [{idx}/{total_images}] SKIP (unreadable): {file_name}")
+                continue
+
+            start = time.time()
+            detections = self.detect_objects(bgr)
+            elapsed = time.time() - start
+
+            self.metrics.update(elapsed, detections)
+
+            # Only compare 'bottle' detections against GT for P/R/F1
+            bottle_dets = [
+                {'bbox': list(d['bbox'].astype(float))}
+                for d in detections if d['label'] == 'bottle'
+            ]
+            ground_truths = gt_by_image.get(img_id, [])
+            self.metrics.evaluate_frame(bottle_dets, ground_truths, iou_threshold)
+
+            if idx % 50 == 0 or idx == total_images:
+                print(f"  [{idx}/{total_images}]  "
+                      f"P={self.metrics.get_precision():.3f}  "
+                      f"R={self.metrics.get_recall():.3f}  "
+                      f"F1={self.metrics.get_f1():.3f}")
+
+        report_dir = self.metrics.save_report()
+        print(f"\nEvaluation complete → {report_dir}/")
+
     # ── Run modes ──────────────────────────────────────────────────────────────
 
     def run_single_frame(self, save_path="detection_all_objects.jpg"):
@@ -606,24 +763,34 @@ class RealsenseDETR:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
+    ANNOTATIONS_JSON = "./my_dataset/All-1.json"
+    IMAGES_DIR       = "./my_dataset/rgb"
+
     print("=" * 60)
     print("  RealSense D435 + DETR  |  All Objects  |  Metrics Report")
     print("=" * 60)
 
+    print("\nSelect mode:")
+    print("1. Single frame detection  (camera)")
+    print("2. Continuous detection    (camera)")
+    print("3. Dataset evaluation  (Precision / Recall / F1  –  no camera)")
+    choice = input("Enter choice (1, 2 or 3): ").strip()
+
     try:
-        detector = RealsenseDETR(confidence_threshold=0.5)
-
-        print("\nSelect mode:")
-        print("1. Single frame detection (auto-saves report)")
-        print("2. Continuous detection  (r=save report, q=quit+report)")
-        choice = input("Enter choice (1 or 2): ").strip()
-
-        if choice == "1":
-            detector.run_single_frame()
+        if choice == "3":
+            detector = RealsenseDETR(confidence_threshold=0.5, no_camera=True)
+            detector.evaluate_dataset(
+                annotations_json=ANNOTATIONS_JSON,
+                images_dir=IMAGES_DIR,
+                iou_threshold=0.5,
+            )
         else:
-            detector.run_continuous()
-
-        detector.cleanup()
+            detector = RealsenseDETR(confidence_threshold=0.5)
+            if choice == "1":
+                detector.run_single_frame()
+            else:
+                detector.run_continuous()
+            detector.cleanup()
 
     except Exception as e:
         print(f"\nError: {str(e)}")

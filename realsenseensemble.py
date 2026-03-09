@@ -51,6 +51,10 @@ class MetricsTracker:
         self.frame_records = []
         self.confidence_history = []
         self.fps_history = []
+        # Ground-truth evaluation counters
+        self.true_positives  = 0
+        self.false_positives = 0
+        self.false_negatives = 0
 
     def update(self, inference_s, m1_count, m2_count, final_count, confidences):
         """
@@ -84,6 +88,48 @@ class MetricsTracker:
             'rejected': m1_count - final_count,
             'avg_confidence': round(float(np.mean(confidences)), 4) if confidences else 0.0,
         })
+
+    # ── Ground-truth evaluation ────────────────────────────────────────────────
+
+    def _iou(self, b1, b2):
+        x1 = max(b1[0], b2[0]); y1 = max(b1[1], b2[1])
+        x2 = min(b1[2], b2[2]); y2 = min(b1[3], b2[3])
+        if x2 < x1 or y2 < y1:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+        a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+        return inter / (a1 + a2 - inter) if (a1+a2-inter) > 0 else 0.0
+
+    def evaluate_frame(self, detections, ground_truths, iou_threshold=0.5):
+        """Match detections to ground truth bboxes and accumulate TP/FP/FN."""
+        matched = set()
+        for det in detections:
+            best_iou, best_idx = 0, -1
+            for i, gt in enumerate(ground_truths):
+                if i in matched:
+                    continue
+                iou = self._iou(det['bbox'], gt['bbox'])
+                if iou > best_iou:
+                    best_iou, best_idx = iou, i
+            if best_iou >= iou_threshold and best_idx >= 0:
+                self.true_positives += 1
+                matched.add(best_idx)
+            else:
+                self.false_positives += 1
+        self.false_negatives += len(ground_truths) - len(matched)
+
+    def get_precision(self):
+        t = self.true_positives + self.false_positives
+        return self.true_positives / t if t > 0 else 0.0
+
+    def get_recall(self):
+        t = self.true_positives + self.false_negatives
+        return self.true_positives / t if t > 0 else 0.0
+
+    def get_f1(self):
+        p, r = self.get_precision(), self.get_recall()
+        return 2*p*r/(p+r) if (p+r) > 0 else 0.0
 
     # ── Computed summaries ─────────────────────────────────────────────────────
 
@@ -124,7 +170,7 @@ class MetricsTracker:
 
     def session_summary(self):
         duration = round(time.time() - self.session_start, 2)
-        return {
+        summary = {
             'session_duration_s': duration,
             'total_frames': self.total_frames(),
             'avg_fps': self.avg_fps(),
@@ -135,6 +181,16 @@ class MetricsTracker:
             'rejection_rate_pct': self.rejection_rate(),
             'avg_final_confidence': self.avg_confidence(),
         }
+        if self.true_positives + self.false_positives + self.false_negatives > 0:
+            summary['evaluation'] = {
+                'precision':       round(self.get_precision(), 4),
+                'recall':          round(self.get_recall(),    4),
+                'f1_score':        round(self.get_f1(),        4),
+                'true_positives':  self.true_positives,
+                'false_positives': self.false_positives,
+                'false_negatives': self.false_negatives,
+            }
+        return summary
 
     def print_summary(self):
         s = self.session_summary()
@@ -150,6 +206,13 @@ class MetricsTracker:
         print(f"  Final detections      : {s['total_final_detections']}")
         print(f"  Rejection rate        : {s['rejection_rate_pct']} %")
         print(f"  Avg final confidence  : {s['avg_final_confidence']:.4f}")
+        if 'evaluation' in s:
+            ev = s['evaluation']
+            print(f"\n  Ground-truth Evaluation (IoU >= 0.5):")
+            print(f"  Precision  : {ev['precision']:.4f}")
+            print(f"  Recall     : {ev['recall']:.4f}")
+            print(f"  F1 Score   : {ev['f1_score']:.4f}")
+            print(f"  TP: {ev['true_positives']}  FP: {ev['false_positives']}  FN: {ev['false_negatives']}")
         print("=" * 60)
 
     # ── Export ─────────────────────────────────────────────────────────────────
@@ -263,6 +326,24 @@ class MetricsTracker:
         plt.close()
         print(f"  Saved: {path}")
 
+        # ── 5. Precision / Recall / F1 (only if GT evaluation was done) ──────
+        if self.true_positives + self.false_positives + self.false_negatives > 0:
+            metrics = ['Precision', 'Recall', 'F1 Score']
+            values  = [self.get_precision(), self.get_recall(), self.get_f1()]
+            colors  = ['steelblue', 'darkorange', 'mediumseagreen']
+            fig, ax = plt.subplots(figsize=(6, 5))
+            bars = ax.bar(metrics, values, color=colors, edgecolor='white')
+            ax.bar_label(bars, fmt='%.4f', padding=3, fontsize=11)
+            ax.set_ylim(0, 1.1)
+            ax.set_title('Precision / Recall / F1 Score  (Cascade DETR)',
+                         fontsize=13, fontweight='bold')
+            ax.set_ylabel('Score')
+            plt.tight_layout()
+            path = os.path.join(output_dir, 'precision_recall_f1.png')
+            plt.savefig(path, dpi=150)
+            plt.close()
+            print(f"  Saved: {path}")
+
     def save_report(self, output_dir=None):
         if output_dir is None:
             output_dir = f"report_cascade_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -284,7 +365,8 @@ class CascadeBottleDetector:
     def __init__(self,
                  confidence_threshold_1=0.70,
                  confidence_threshold_2=0.85,
-                 reject_iou_threshold=0.6):
+                 reject_iou_threshold=0.6,
+                 no_camera=False):
 
         print("=" * 70)
         print("  CASCADE DETR  |  Custom-Trained Bottle + Hard-Negative Rejector")
@@ -322,7 +404,9 @@ class CascadeBottleDetector:
         print("  Labels:", self.model_2.config.id2label)
 
         self.metrics = MetricsTracker()
-        self.initialize_camera()
+        self.pipeline = None
+        if not no_camera:
+            self.initialize_camera()
 
     # ── Camera ─────────────────────────────────────────────────────────────────
 
@@ -615,6 +699,79 @@ class CascadeBottleDetector:
             y += 22
         return image
 
+    # ── Dataset evaluation ─────────────────────────────────────────────────────
+
+    def evaluate_dataset(self, annotations_json, images_dir, iou_threshold=0.5):
+        """
+        Evaluate Precision / Recall / F1 against COCO-format ground truth.
+
+        Runs the full 3-layer cascade (M1 → M2 → heuristic) on each image
+        from disk and compares final detections to GT bboxes from All-1.json.
+
+        Args:
+            annotations_json : path to All-1.json (COCO format)
+            images_dir       : directory containing the RGB images
+            iou_threshold    : IoU threshold for a TP match (default 0.5)
+        """
+        print("\n" + "=" * 60)
+        print("  CASCADE DETR  |  DATASET EVALUATION  (no camera)")
+        print("=" * 60)
+        print(f"  Annotations : {annotations_json}")
+        print(f"  Images dir  : {images_dir}")
+        print(f"  IoU thresh  : {iou_threshold}")
+
+        with open(annotations_json) as f:
+            coco = json.load(f)
+
+        id2file = {img['id']: img['file_name'] for img in coco['images']}
+
+        gt_by_image = defaultdict(list)
+        for ann in coco['annotations']:
+            if 'bbox' not in ann:
+                continue
+            x, y, w, h = ann['bbox']
+            gt_by_image[ann['image_id']].append({'bbox': [x, y, x + w, y + h]})
+
+        self.metrics.reset()
+        total_images = len(id2file)
+        print(f"\nRunning on {total_images} images...\n")
+
+        for idx, (img_id, file_name) in enumerate(id2file.items(), 1):
+            img_path = os.path.join(images_dir, file_name)
+            if not os.path.exists(img_path):
+                img_path = os.path.join(images_dir, os.path.basename(file_name))
+            if not os.path.exists(img_path):
+                print(f"  [{idx}/{total_images}] SKIP (not found): {file_name}")
+                continue
+
+            bgr = cv2.imread(img_path)
+            if bgr is None:
+                print(f"  [{idx}/{total_images}] SKIP (unreadable): {file_name}")
+                continue
+
+            start = time.time()
+            m1, m2, hr, final = self.detect_bottles(bgr)
+            elapsed = time.time() - start
+
+            confs = [d['confidence'] for d in final]
+            self.metrics.update(elapsed, len(m1), len(m2), len(final), confs)
+
+            # Convert final detections to the format evaluate_frame expects
+            final_for_eval = [
+                {'bbox': list(d['bbox'].astype(float))} for d in final
+            ]
+            ground_truths = gt_by_image.get(img_id, [])
+            self.metrics.evaluate_frame(final_for_eval, ground_truths, iou_threshold)
+
+            if idx % 50 == 0 or idx == total_images:
+                print(f"  [{idx}/{total_images}]  "
+                      f"P={self.metrics.get_precision():.3f}  "
+                      f"R={self.metrics.get_recall():.3f}  "
+                      f"F1={self.metrics.get_f1():.3f}")
+
+        report_dir = self.metrics.save_report()
+        print(f"\nEvaluation complete → {report_dir}/")
+
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     def run(self):
@@ -696,12 +853,37 @@ class CascadeBottleDetector:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    detector = CascadeBottleDetector(
-        confidence_threshold_1=0.70,
-        confidence_threshold_2=0.85,
-        reject_iou_threshold=0.6
-    )
-    detector.run()
+    ANNOTATIONS_JSON = "./my_dataset/All-1.json"
+    IMAGES_DIR       = "./my_dataset/rgb"
+
+    print("=" * 60)
+    print("  CASCADE DETR  |  Bottle Detection")
+    print("=" * 60)
+    print("\nSelect mode:")
+    print("1. Live detection  (camera)")
+    print("2. Dataset evaluation  (Precision / Recall / F1  –  no camera)")
+
+    choice = input("Enter choice (1 or 2): ").strip()
+
+    if choice == "2":
+        detector = CascadeBottleDetector(
+            confidence_threshold_1=0.70,
+            confidence_threshold_2=0.85,
+            reject_iou_threshold=0.6,
+            no_camera=True,
+        )
+        detector.evaluate_dataset(
+            annotations_json=ANNOTATIONS_JSON,
+            images_dir=IMAGES_DIR,
+            iou_threshold=0.5,
+        )
+    else:
+        detector = CascadeBottleDetector(
+            confidence_threshold_1=0.70,
+            confidence_threshold_2=0.85,
+            reject_iou_threshold=0.6,
+        )
+        detector.run()
 
 
 if __name__ == "__main__":

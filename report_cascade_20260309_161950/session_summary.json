@@ -1,0 +1,11 @@
+{
+  "session_duration_s": 1140.82,
+  "total_frames": 5570,
+  "avg_fps": 6.45,
+  "avg_inference_ms": 155.03,
+  "total_m1_candidates": 140,
+  "total_m2_rejections": 110,
+  "total_final_detections": 30,
+  "rejection_rate_pct": 78.6,
+  "avg_final_confidence": 0.9647
+}

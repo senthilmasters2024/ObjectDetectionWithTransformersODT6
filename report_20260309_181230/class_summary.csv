@@ -1,0 +1,5 @@
+class,count,avg_confidence,min_confidence,max_confidence
+person,381,0.825,0.5008,0.9999
+bottle,202,0.925,0.5089,0.9993
+cup,33,0.8823,0.5293,0.9988
+cell phone,2,0.6434,0.5729,0.7138
